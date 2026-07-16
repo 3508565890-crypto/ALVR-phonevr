@@ -61,6 +61,33 @@ impl StatisticsManager {
         }
     }
 
+    // Diagnostic-only: ensure a history frame exists for the given video frame timestamp.
+    // On PhoneVR/Cardboard the statistics history is keyed by the pose prediction timestamp
+    // (GetBootTimeNano() + offset), which never equals the video frame timestamp passed to
+    // alvr_report_submit. Without this, report_video_packet_received / report_compositor_start /
+    // report_submit never find the frame and frame_interval stays 0 (server shows client_fps = 0).
+    // This does NOT change decode, display, or frame submission timing.
+    pub fn ensure_frame(&mut self, target_timestamp: Duration) {
+        if !self
+            .history_buffer
+            .iter()
+            .any(|frame| frame.client_stats.target_timestamp == target_timestamp)
+        {
+            self.history_buffer.push_front(HistoryFrame {
+                input_acquired: Instant::now(),
+                video_packet_received: Instant::now(),
+                client_stats: ClientStatistics {
+                    target_timestamp,
+                    ..Default::default()
+                },
+            });
+        }
+
+        if self.history_buffer.len() > self.max_history_size {
+            self.history_buffer.pop_back();
+        }
+    }
+
     pub fn report_video_packet_received(&mut self, target_timestamp: Duration) {
         if let Some(frame) = self
             .history_buffer
