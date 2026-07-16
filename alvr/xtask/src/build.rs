@@ -309,7 +309,7 @@ fn build_android_lib_impl(dir_name: &str, profile: Profile, link_stdcpp: bool) {
         "x86_64",
         "-t",
         "x86",
-        "-p",
+        "-P",
         "26",
         "--no-strip",
     ];
