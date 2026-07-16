@@ -311,7 +311,6 @@ fn build_android_lib_impl(dir_name: &str, profile: Profile, link_stdcpp: bool) {
         "x86",
         "-P",
         "26",
-        "--no-strip",
     ];
 
     let mut rust_flags = vec![];
