@@ -350,5 +350,7 @@ pub fn build_android_deps(skip_admin_priv: bool) {
         .run()
         .unwrap();
 
-    get_android_openxr_loaders();
+    if std::env::var_os("ALVR_SKIP_ANDROID_OPENXR_LOADERS").is_none() {
+        get_android_openxr_loaders();
+    }
 }
