@@ -313,6 +313,7 @@ impl ClientCoreContext {
         };
 
         if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
+            stats.ensure_frame(frame_timestamp);
             stats.report_compositor_start(frame_timestamp);
         }
 
