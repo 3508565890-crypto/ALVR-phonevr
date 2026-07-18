@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use crate::decoder::DecoderConfig;
+use crate::statistics::get_diagnostics_arc;
 
 struct FakeThreadSafe<T>(T);
 unsafe impl<T> Send for FakeThreadSafe<T> {}
