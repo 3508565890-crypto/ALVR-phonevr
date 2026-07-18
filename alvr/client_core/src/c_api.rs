@@ -236,6 +236,7 @@ pub unsafe extern "C" fn alvr_initialize_android_context(
     context: *mut c_void,
 ) {
     ndk_context::initialize_android_context(java_vm, context);
+    crate::init_logging();
 }
 
 /// On android, alvr_initialize_android_context() must be called first, then alvr_initialize().
