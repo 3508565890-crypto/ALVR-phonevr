@@ -126,7 +126,7 @@ impl VideoDecoderSource {
         if let Some(queued_image) = image_queue_lock.front_mut() {
             queued_image.in_use = true;
 
-            // Diagnostics: count successful get_frame calls (only when a frame is actually returned)
+            // Diagnostics: count successful get_frame calls
             let diagnostics = crate::statistics::get_diagnostics_arc();
             diagnostics.get_frame.fetch_add(1, Ordering::Relaxed);
 
