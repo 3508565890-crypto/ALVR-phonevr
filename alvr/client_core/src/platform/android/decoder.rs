@@ -2,7 +2,8 @@ use alvr_common::{
     anyhow::{anyhow, bail, Context, Result},
     error, info,
     parking_lot::{Condvar, Mutex},
-    show_e, warn, RelaxedAtomic,
+    sync::Arc,
+    warn, RelaxedAtomic,
 };
 use alvr_session::{CodecType, MediacodecDataType};
 use ndk::{
@@ -21,6 +22,7 @@ use std::{
     ops::Deref,
     ptr,
     sync::Arc,
+    sync::atomic::Ordering,
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -123,6 +125,14 @@ impl VideoDecoderSource {
 
         if let Some(queued_image) = image_queue_lock.front_mut() {
             queued_image.in_use = true;
+
+            // Diagnostics: count successful get_frame calls (only when a frame is actually returned)
+            let diagnostics = crate::statistics::get_diagnostics_arc();
+            diagnostics.get_frame.fetch_add(1, Ordering::Relaxed);
+
+            // Update queue_len_max from actual decoder queue length
+            let queue_len = image_queue_lock.len() as u64;
+            diagnostics.queue_len_max.fetch_max(queue_len, Ordering::Relaxed);
 
             Ok(Some((
                 queued_image.timestamp,

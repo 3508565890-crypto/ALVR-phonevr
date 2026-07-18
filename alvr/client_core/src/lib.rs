@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
     sync::Arc,
+    sync::atomic::Ordering,
     thread::{self, JoinHandle},
     time::Duration,
 };
