@@ -2,8 +2,7 @@ use alvr_common::{
     anyhow::{anyhow, bail, Context, Result},
     error, info,
     parking_lot::{Condvar, Mutex},
-    sync::Arc,
-    warn, RelaxedAtomic,
+    show_e, warn, RelaxedAtomic,
 };
 use alvr_session::{CodecType, MediacodecDataType};
 use ndk::{
@@ -22,12 +21,11 @@ use std::{
     ops::Deref,
     ptr,
     sync::Arc,
-    sync::atomic::Ordering,
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use crate::statistics::get_diagnostics_arc;
+use crate::decoder::DecoderConfig;
 
 struct FakeThreadSafe<T>(T);
 unsafe impl<T> Send for FakeThreadSafe<T> {}
@@ -126,15 +124,7 @@ impl VideoDecoderSource {
         if let Some(queued_image) = image_queue_lock.front_mut() {
             queued_image.in_use = true;
 
-            // Diagnostics: count successful get_frame calls
-            let diagnostics = crate::statistics::get_diagnostics_arc();
-            diagnostics.get_frame.fetch_add(1, Ordering::Relaxed);
-
-            // Update queue_len_max from actual decoder queue length
-            let queue_len = image_queue_lock.len() as u64;
-            diagnostics.queue_len_max.fetch_max(queue_len, Ordering::Relaxed);
-
-            Ok(Some((
+            let frame = (
                 queued_image.timestamp,
                 queued_image
                     .image
@@ -142,7 +132,11 @@ impl VideoDecoderSource {
                     .unwrap()
                     .as_ptr()
                     .cast(),
-            )))
+            );
+
+            crate::statistics::get_diagnostics_arc().report_get_frame();
+
+            Ok(Some(frame))
         } else {
             // TODO: add back when implementing proper phase sync
             //warn!("Video frame queue underflow!");
@@ -238,6 +232,10 @@ fn decoder_lifecycle(
                             image,
                             in_use: false,
                         });
+
+                        let queue_len = image_queue_lock.len() as u64;
+                        crate::statistics::get_diagnostics_arc()
+                            .update_queue_len_max(queue_len);
                     } else {
                         error!("ImageReader error: No image available");
 
