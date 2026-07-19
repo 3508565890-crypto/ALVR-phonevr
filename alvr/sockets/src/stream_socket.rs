@@ -18,7 +18,7 @@
 
 use crate::backend::{tcp, udp, SocketReader, SocketWriter};
 use alvr_common::{
-    anyhow::Result, debug, parking_lot::Mutex, AnyhowToCon, ConResult, HandleTryAgain, ToCon,
+    anyhow::Result, debug, parking_lot::Mutex, warn, AnyhowToCon, ConResult, HandleTryAgain, ToCon,
 };
 use alvr_session::{DscpTos, SocketBufferSize, SocketProtocol};
 use serde::{de::DeserializeOwned, Serialize};
@@ -28,8 +28,11 @@ use std::{
     marker::PhantomData,
     mem,
     net::{IpAddr, TcpListener, UdpSocket},
-    sync::{mpsc, Arc},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        mpsc, Arc,
+    },
+    time::{Duration, Instant},
 };
 
 const SHARD_PREFIX_SIZE: usize = mem::size_of::<u32>() // packet length - field itself (4 bytes)
@@ -37,6 +40,7 @@ const SHARD_PREFIX_SIZE: usize = mem::size_of::<u32>() // packet length - field 
     + mem::size_of::<u32>() // packet index
     + mem::size_of::<u32>() // shards count
     + mem::size_of::<u32>(); // shards index
+const STREAM_RECV_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Memory buffer that contains a hidden prefix
 #[derive(Default)]
@@ -204,10 +208,131 @@ struct ReconstructedPacket {
     size: usize, // contains prefix
 }
 
+struct StreamRecvDiagnostics {
+    stream_id: u16,
+    start_time: Instant,
+    last_log_ms: AtomicU64,
+    gap_events: AtomicU64,
+    gap_packets: AtomicU64,
+    old_completed: AtomicU64,
+    recycled_incomplete: AtomicU64,
+    cleanup_incomplete: AtomicU64,
+    no_free_buffer_shards: AtomicU64,
+    queued_now: AtomicU64,
+    queued_max: AtomicU64,
+    in_progress_now: AtomicU64,
+    in_progress_max: AtomicU64,
+}
+
+impl StreamRecvDiagnostics {
+    fn new(stream_id: u16) -> Self {
+        Self {
+            stream_id,
+            start_time: Instant::now(),
+            last_log_ms: AtomicU64::new(0),
+            gap_events: AtomicU64::new(0),
+            gap_packets: AtomicU64::new(0),
+            old_completed: AtomicU64::new(0),
+            recycled_incomplete: AtomicU64::new(0),
+            cleanup_incomplete: AtomicU64::new(0),
+            no_free_buffer_shards: AtomicU64::new(0),
+            queued_now: AtomicU64::new(0),
+            queued_max: AtomicU64::new(0),
+            in_progress_now: AtomicU64::new(0),
+            in_progress_max: AtomicU64::new(0),
+        }
+    }
+
+    fn packet_queued(&self) {
+        let queued_now = self.queued_now.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        self.queued_max
+            .fetch_max(queued_now, AtomicOrdering::Relaxed);
+    }
+
+    fn packet_dequeued(&self) {
+        self.queued_now.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+
+    fn update_in_progress(&self, count: usize) {
+        let count = count as u64;
+
+        self.in_progress_now
+            .store(count, AtomicOrdering::Relaxed);
+        self.in_progress_max
+            .fetch_max(count, AtomicOrdering::Relaxed);
+    }
+
+    fn maybe_log(&self) {
+        let now_ms = self.start_time.elapsed().as_millis() as u64;
+        let last_log_ms = self.last_log_ms.load(AtomicOrdering::Relaxed);
+
+        if now_ms.saturating_sub(last_log_ms)
+            < STREAM_RECV_DIAGNOSTICS_INTERVAL.as_millis() as u64
+            || self
+                .last_log_ms
+                .compare_exchange(
+                    last_log_ms,
+                    now_ms,
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
+
+        let gap_events = self.gap_events.swap(0, AtomicOrdering::Relaxed);
+        let gap_packets = self.gap_packets.swap(0, AtomicOrdering::Relaxed);
+        let old_completed = self.old_completed.swap(0, AtomicOrdering::Relaxed);
+        let recycled_incomplete = self
+            .recycled_incomplete
+            .swap(0, AtomicOrdering::Relaxed);
+        let cleanup_incomplete = self
+            .cleanup_incomplete
+            .swap(0, AtomicOrdering::Relaxed);
+        let no_free_buffer_shards = self
+            .no_free_buffer_shards
+            .swap(0, AtomicOrdering::Relaxed);
+        let queued_max = self.queued_max.swap(0, AtomicOrdering::Relaxed);
+        let queued_now = self.queued_now.load(AtomicOrdering::Relaxed);
+        self.queued_max
+            .fetch_max(queued_now, AtomicOrdering::Relaxed);
+        let queued_max = queued_max.max(queued_now);
+        let in_progress_max = self.in_progress_max.swap(0, AtomicOrdering::Relaxed);
+        let in_progress_now = self.in_progress_now.load(AtomicOrdering::Relaxed);
+        self.in_progress_max
+            .fetch_max(in_progress_now, AtomicOrdering::Relaxed);
+        let in_progress_max = in_progress_max.max(in_progress_now);
+
+        if gap_events > 0
+            || gap_packets > 0
+            || old_completed > 0
+            || recycled_incomplete > 0
+            || cleanup_incomplete > 0
+            || no_free_buffer_shards > 0
+        {
+            warn!(
+                "[PHONEVR-STREAM-RECV] stream_id={} gap_events={} gap_packets={} old_completed={} recycled_incomplete={} cleanup_incomplete={} no_free_buffer_shards={} queued_now={} queued_max={} in_progress_max={}",
+                self.stream_id,
+                gap_events,
+                gap_packets,
+                old_completed,
+                recycled_incomplete,
+                cleanup_incomplete,
+                no_free_buffer_shards,
+                queued_now,
+                queued_max,
+                in_progress_max,
+            );
+        }
+    }
+}
+
 pub struct StreamReceiver<H> {
     packet_receiver: mpsc::Receiver<ReconstructedPacket>,
     used_buffer_queue: mpsc::Sender<Vec<u8>>,
     last_packet_index: Option<u32>,
+    diagnostics: Arc<StreamRecvDiagnostics>,
     _phantom: PhantomData<H>,
 }
 
@@ -231,6 +356,7 @@ impl<H: DeserializeOwned + Serialize> StreamReceiver<H> {
             .packet_receiver
             .recv_timeout(timeout)
             .handle_try_again()?;
+        self.diagnostics.packet_dequeued();
 
         let mut had_packet_loss = false;
 
@@ -240,16 +366,29 @@ impl<H: DeserializeOwned + Serialize> StreamReceiver<H> {
                 Ordering::Equal => (),
                 Ordering::Greater => {
                     // Skipped some indices
+                    let missing_packets = packet.index.wrapping_sub(last_idx.wrapping_add(1));
+
+                    self.diagnostics
+                        .gap_events
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    self.diagnostics
+                        .gap_packets
+                        .fetch_add(missing_packets as u64, AtomicOrdering::Relaxed);
                     had_packet_loss = true
                 }
                 Ordering::Less => {
                     // Old packet, discard
+                    self.diagnostics
+                        .old_completed
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    self.diagnostics.maybe_log();
                     self.used_buffer_queue.send(packet.buffer).to_con()?;
                     return alvr_common::try_again();
                 }
             }
         }
         self.last_packet_index = Some(packet.index);
+        self.diagnostics.maybe_log();
 
         Ok(ReceiverData {
             buffer: Some(packet.buffer),
@@ -395,6 +534,7 @@ struct StreamRecvComponents {
     packet_queue: mpsc::Sender<ReconstructedPacket>,
     in_progress_packets: HashMap<u32, InProgressPacket>,
     discarded_shards_sink: InProgressPacket,
+    diagnostics: Arc<StreamRecvDiagnostics>,
 }
 
 // Note: used buffers don't *have* to be split by stream ID, but doing so improves memory usage
@@ -429,6 +569,7 @@ impl StreamSocket {
     ) -> StreamReceiver<T> {
         let (packet_sender, packet_receiver) = mpsc::channel();
         let (used_buffer_sender, used_buffer_receiver) = mpsc::channel();
+        let diagnostics = Arc::new(StreamRecvDiagnostics::new(stream_id));
 
         for _ in 0..max_concurrent_buffers {
             used_buffer_sender.send(vec![]).ok();
@@ -446,6 +587,7 @@ impl StreamSocket {
                     buffer_length: 0,
                     received_shard_indices: HashSet::new(),
                 },
+                diagnostics: Arc::clone(&diagnostics),
             },
         );
 
@@ -454,6 +596,7 @@ impl StreamSocket {
             used_buffer_queue: used_buffer_sender,
             _phantom: PhantomData,
             last_packet_index: None,
+            diagnostics,
         }
     }
 
@@ -498,6 +641,7 @@ impl StreamSocket {
             );
             return alvr_common::try_again();
         };
+        let mut should_check_diagnostics = false;
 
         let in_progress_packet = if shard_recv_state_mut.should_discard {
             &mut components.discarded_shards_sink
@@ -511,6 +655,11 @@ impl StreamSocket {
             // in progress packets, chances are these buffers are "dead" because one of their shards
             // has been dropped by the network.
             let idx = *components.in_progress_packets.iter().next()?.0;
+            components
+                .diagnostics
+                .recycled_incomplete
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            should_check_diagnostics = true;
             Some(components.in_progress_packets.remove(&idx).unwrap().buffer)
         }) {
             // NB: Can't use entry pattern because we want to allow bailing out on the line above
@@ -526,11 +675,19 @@ impl StreamSocket {
                 },
             );
             components
+                .diagnostics
+                .update_in_progress(components.in_progress_packets.len());
+            components
                 .in_progress_packets
                 .get_mut(&shard_recv_state_mut.packet_index)
                 .unwrap()
         } else {
             // This branch may be hit in case the thread related to the stream hangs for some reason
+            components
+                .diagnostics
+                .no_free_buffer_shards
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            should_check_diagnostics = shard_recv_state_mut.shard_index == 0;
             shard_recv_state_mut.should_discard = true;
             shard_recv_state_mut.packet_cursor = 0; // reset cursor from old shards
                                                     // always write at the start of the packet so the buffer doesn't grow much
@@ -593,18 +750,20 @@ impl StreamSocket {
         // Check if packet is complete and send
         if in_progress_packet.received_shard_indices.len() == shard_recv_state_mut.shards_count {
             let size = in_progress_packet.buffer_length;
-            components
-                .packet_queue
-                .send(ReconstructedPacket {
-                    index: shard_recv_state_mut.packet_index,
-                    buffer: components
-                        .in_progress_packets
-                        .remove(&shard_recv_state_mut.packet_index)
-                        .unwrap()
-                        .buffer,
-                    size,
-                })
-                .ok();
+            let packet = ReconstructedPacket {
+                index: shard_recv_state_mut.packet_index,
+                buffer: components
+                    .in_progress_packets
+                    .remove(&shard_recv_state_mut.packet_index)
+                    .unwrap()
+                    .buffer,
+                size,
+            };
+
+            components.diagnostics.packet_queued();
+            if components.packet_queue.send(packet).is_err() {
+                components.diagnostics.packet_dequeued();
+            }
 
             // Keep only shards with later packet index (using wrapping logic)
             while let Some((idx, _)) = components.in_progress_packets.iter().find(|(idx, _)| {
@@ -612,10 +771,23 @@ impl StreamSocket {
             }) {
                 let idx = *idx; // fix borrow rule
                 let packet = components.in_progress_packets.remove(&idx).unwrap();
+                components
+                    .diagnostics
+                    .cleanup_incomplete
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                should_check_diagnostics = true;
 
                 // Recycle buffer
                 components.used_buffer_sender.send(packet.buffer).ok();
             }
+
+            components
+                .diagnostics
+                .update_in_progress(components.in_progress_packets.len());
+        }
+
+        if should_check_diagnostics {
+            components.diagnostics.maybe_log();
         }
 
         // Mark current shard as read and allow for a new shard to be read
