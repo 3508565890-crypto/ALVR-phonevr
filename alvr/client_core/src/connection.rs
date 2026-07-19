@@ -62,8 +62,11 @@ const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
+const IDR_REQUEST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const VIDEO_RECOVERY_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
+const VIDEO_MAX_UNREAD_PACKETS: usize = 32;
 
 #[derive(Default)]
 pub struct ConnectionContext {
@@ -95,6 +98,14 @@ fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str
 
 fn is_streaming(ctx: &ConnectionContext) -> bool {
     *ctx.state.read() == ConnectionState::Streaming
+}
+
+fn send_idr_request(ctx: &ConnectionContext) -> bool {
+    if let Some(sender) = &mut *ctx.control_sender.lock() {
+        sender.send(&ClientControlPacket::RequestIdr).is_ok()
+    } else {
+        false
+    }
 }
 
 pub fn connection_lifecycle_loop(
@@ -275,8 +286,8 @@ fn connection_pipeline(
 
     info!("Connected to server");
 
-    let mut video_receiver =
-        stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO, MAX_UNREAD_PACKETS);
+    let mut video_receiver = stream_socket
+        .subscribe_to_stream::<VideoPacketHeader>(VIDEO, VIDEO_MAX_UNREAD_PACKETS);
     let mut game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
     let tracking_sender = stream_socket.request_stream(TRACKING);
     let mut haptics_receiver =
@@ -288,6 +299,13 @@ fn connection_pipeline(
         let event_queue = Arc::clone(&event_queue);
         move || {
             let mut stream_corrupted = false;
+            let mut last_idr_request_time = None;
+            let mut last_recovery_log_time = Instant::now();
+            let mut reconstructed_packet_gaps = 0_u64;
+            let mut waiting_for_idr_frames = 0_u64;
+            let mut decoder_saturation = 0_u64;
+            let mut idr_requests_sent = 0_u64;
+
             while is_streaming(&ctx) {
                 let data = match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(data) => data,
@@ -302,14 +320,30 @@ fn connection_pipeline(
                     stats.report_video_packet_received(header.timestamp);
                 }
 
+                if data.had_packet_loss() {
+                    reconstructed_packet_gaps += 1;
+                }
+
                 if header.is_idr {
                     stream_corrupted = false;
-                } else if data.had_packet_loss() {
+                    last_idr_request_time = None;
+                } else if data.had_packet_loss() && !stream_corrupted {
                     stream_corrupted = true;
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender.send(&ClientControlPacket::RequestIdr).ok();
+                    last_idr_request_time = Some(Instant::now());
+                    if send_idr_request(&ctx) {
+                        idr_requests_sent += 1;
                     }
-                    warn!("Network dropped video packet");
+                }
+
+                if stream_corrupted
+                    && last_idr_request_time
+                        .map(|time| time.elapsed() >= IDR_REQUEST_RETRY_INTERVAL)
+                        .unwrap_or(true)
+                {
+                    last_idr_request_time = Some(Instant::now());
+                    if send_idr_request(&ctx) {
+                        idr_requests_sent += 1;
+                    }
                 }
 
                 if !stream_corrupted || !settings.connection.avoid_video_glitching {
@@ -333,17 +367,41 @@ fn connection_pipeline(
                         .map(|sink| sink.push_nal(header.timestamp, nal))
                         .unwrap_or(false)
                     {
-                        stream_corrupted = true;
-                        if let Some(sender) = &mut *ctx.control_sender.lock() {
-                            sender.send(&ClientControlPacket::RequestIdr).ok();
+                        decoder_saturation += 1;
+
+                        if !stream_corrupted {
+                            last_idr_request_time = Some(Instant::now());
+                            if send_idr_request(&ctx) {
+                                idr_requests_sent += 1;
+                            }
                         }
-                        warn!("Dropped video packet. Reason: Decoder saturation")
+
+                        stream_corrupted = true;
                     }
                 } else {
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender.send(&ClientControlPacket::RequestIdr).ok();
+                    waiting_for_idr_frames += 1;
+                }
+
+                if last_recovery_log_time.elapsed() >= VIDEO_RECOVERY_LOG_INTERVAL {
+                    if reconstructed_packet_gaps > 0
+                        || waiting_for_idr_frames > 0
+                        || decoder_saturation > 0
+                        || idr_requests_sent > 0
+                    {
+                        warn!(
+                            "[PHONEVR-VIDEO-RECOVERY] reconstructed_packet_gaps={} waiting_for_idr_frames={} decoder_saturation={} idr_requests_sent={}",
+                            reconstructed_packet_gaps,
+                            waiting_for_idr_frames,
+                            decoder_saturation,
+                            idr_requests_sent,
+                        );
                     }
-                    warn!("Dropped video packet. Reason: Waiting for IDR frame")
+
+                    reconstructed_packet_gaps = 0;
+                    waiting_for_idr_frames = 0;
+                    decoder_saturation = 0;
+                    idr_requests_sent = 0;
+                    last_recovery_log_time = Instant::now();
                 }
             }
         }
